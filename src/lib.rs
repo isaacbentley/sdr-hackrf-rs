@@ -39,6 +39,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::info;
 
+/// Scale one signed 8-bit ADC sample to `[-1, 1)`.
+///
+/// Divides by 128, not 127. `i8` spans -128..=127, so dividing by 127 maps
+/// full-scale negative to -1.008 — outside the range this module documents,
+/// and reached by any strong signal that drives the ADC to its rail. 128 is
+/// the half-range, giving exactly [-1, 1): -128 -> -1.0 and +127 -> +0.992.
+#[inline]
+fn i8_to_unit(byte: u8) -> f32 {
+    f32::from(byte as i8) / 128.0
+}
+
 /// Highest RX sample rate we let a caller request. The HackRF One is a
 /// USB 2.0 device; above ~20 MSPS the bulk transport can't keep up and
 /// drops samples wholesale.
@@ -396,10 +407,7 @@ impl SdrSource for HackRfSource {
                                         .unwrap_or_else(|_| Vec::with_capacity(131072));
                                     samples.clear();
                                     samples.extend(bytes.chunks_exact(2).map(|c| {
-                                        Complex32::new(
-                                            (c[0] as i8) as f32 / 127.0,
-                                            (c[1] as i8) as f32 / 127.0,
-                                        )
+                                        Complex32::new(i8_to_unit(c[0]), i8_to_unit(c[1]))
                                     }));
                                     if !samples.is_empty() {
                                         let pkt = IqPacket {
@@ -505,5 +513,36 @@ mod tests {
         let (rate, clamped) = resolve_sample_rate(1, 40_000_000.0).unwrap();
         assert_eq!(rate, HACKRF_MAX_SAMPLE_RATE_HZ);
         assert!(clamped);
+    }
+}
+
+#[cfg(test)]
+mod sample_scaling_tests {
+    use super::i8_to_unit;
+
+    /// The ADC's extremes must land inside the documented `[-1, 1)` range.
+    /// Dividing by 127 put full-scale negative at -1.008, which any signal
+    /// strong enough to hit the rail would produce.
+    #[test]
+    fn full_scale_samples_stay_in_the_documented_range() {
+        assert_eq!(i8_to_unit(0x80), -1.0, "-128 is exactly -1.0");
+        assert!(i8_to_unit(0x7F) < 1.0, "+127 must stay below +1.0");
+        for raw in 0u16..=255 {
+            let v = i8_to_unit(raw as u8);
+            assert!(
+                (-1.0..1.0).contains(&v),
+                "raw {raw} scaled to {v}, outside [-1, 1)"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_and_sign_are_preserved() {
+        assert_eq!(i8_to_unit(0), 0.0);
+        assert!(i8_to_unit(0x01) > 0.0, "+1 is positive");
+        assert!(i8_to_unit(0xFF) < 0.0, "-1 (0xFF) is negative");
+        // Symmetric magnitudes either side of zero.
+        assert_eq!(i8_to_unit(0x40), 0.5, "+64 is half scale");
+        assert_eq!(i8_to_unit(0xC0), -0.5, "-64 is minus half scale");
     }
 }
