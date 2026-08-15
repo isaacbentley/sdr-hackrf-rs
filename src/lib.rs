@@ -62,6 +62,30 @@ pub const HACKRF_MAX_SAMPLE_RATE_HZ: f64 = 20_000_000.0;
 /// of spinning silently.
 const MAX_CONSECUTIVE_SWEEP_FAILURES: u32 = 10;
 
+/// Consecutive RX-streaming failures tolerated before giving up on the device.
+///
+/// Distinct from `MAX_CONSECUTIVE_SWEEP_FAILURES`, which counts *tuning*
+/// failures, and it has to be: `consecutive_failures` is reset immediately
+/// after a successful tune and `into_rx_mode`, before any samples are read. A
+/// device that tunes perfectly well but cannot stream — a half-dead USB link,
+/// a HackRF wedged after a bus reset — therefore reset the tuning counter on
+/// every pass and retuned forever without ever reaching the "Giving up" path.
+/// This counter is reset only when a packet is actually delivered, so it
+/// measures the thing that matters: are samples reaching the caller?
+const MAX_CONSECUTIVE_STREAM_FAILURES: u32 = 20;
+
+/// Pause after a streaming failure before retuning.
+///
+/// The retune path has no natural delay, so without this a device that
+/// consistently fails at `start_rx` spins the outer loop at full speed.
+const STREAM_FAILURE_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Should the device be abandoned after this many consecutive streaming
+/// failures? Extracted so the decision is testable without hardware.
+fn should_abandon_device(consecutive_stream_failures: u32) -> bool {
+    consecutive_stream_failures >= MAX_CONSECUTIVE_STREAM_FAILURES
+}
+
 /// Builder for a HackRF One source. Wrap in `Box::new(...)` and call
 /// [`SdrSource::start`] from the orchestrator.
 pub struct HackRfSource {
@@ -211,10 +235,29 @@ impl SdrSource for HackRfSource {
                     let mut channel_switches = 0u64;
                     let mut consecutive_failures = 0;
                     let mut consecutive_sweep_failures = 0;
+                    // Reset only when a packet is delivered — see
+                    // MAX_CONSECUTIVE_STREAM_FAILURES.
+                    let mut consecutive_stream_failures = 0u32;
 
                     'outer: loop {
                         if stop_flag_thread.load(Ordering::SeqCst) {
                             break;
+                        }
+
+                        // A device that tunes fine but never streams would
+                        // otherwise retune forever, because the tuning counter
+                        // below is reset on every successful tune.
+                        if should_abandon_device(consecutive_stream_failures) {
+                            tracing::error!(
+                                "[hackrf] {} consecutive RX streaming failures with no samples \
+                                 delivered. Giving up — is the HackRF still connected?",
+                                consecutive_stream_failures
+                            );
+                            break 'outer;
+                        }
+                        if consecutive_stream_failures > 0 {
+                            // Pace the retune; this path has no natural delay.
+                            thread::sleep(STREAM_FAILURE_BACKOFF);
                         }
 
                         if consecutive_failures >= num_channels {
@@ -425,12 +468,19 @@ impl SdrSource for HackRfSource {
                                             let _ = rx.stop_rx();
                                             break 'outer;
                                         }
+                                        // Samples are reaching the caller, which
+                                        // is the only proof the device works.
+                                        consecutive_stream_failures = 0;
                                     }
                                 }
                                 Err(e) => {
                                     // A transient USB read error ends this dwell;
                                     // the outer loop retunes and re-enters RX.
-                                    tracing::warn!("[hackrf] rx error: {e:?}");
+                                    consecutive_stream_failures += 1;
+                                    tracing::warn!(
+                                        "[hackrf] rx error ({} consecutive): {e:?}",
+                                        consecutive_stream_failures
+                                    );
                                     break rx
                                         .stop_rx()
                                         .map_err(|e| anyhow::anyhow!("stop_rx: {e:?}"))?;
@@ -544,5 +594,41 @@ mod sample_scaling_tests {
         // Symmetric magnitudes either side of zero.
         assert_eq!(i8_to_unit(0x40), 0.5, "+64 is half scale");
         assert_eq!(i8_to_unit(0xC0), -0.5, "-64 is minus half scale");
+    }
+}
+
+#[cfg(test)]
+mod stream_failure_bounding_tests {
+    use super::*;
+
+    /// Transient streaming errors must not abandon a working device.
+    #[test]
+    fn transient_stream_errors_are_tolerated() {
+        for n in 0..MAX_CONSECUTIVE_STREAM_FAILURES {
+            assert!(!should_abandon_device(n));
+        }
+    }
+
+    /// A device that never delivers samples must be given up on.
+    ///
+    /// The specific failure this guards: `consecutive_failures` is reset right
+    /// after a successful tune and `into_rx_mode`, before any samples are read,
+    /// so a HackRF that tunes but cannot stream reset that counter on every
+    /// pass and retuned forever without ever reaching the "Giving up" path.
+    /// This counter is reset only when a packet is actually delivered.
+    #[test]
+    fn a_device_that_never_streams_is_abandoned() {
+        assert!(should_abandon_device(MAX_CONSECUTIVE_STREAM_FAILURES));
+        assert!(should_abandon_device(MAX_CONSECUTIVE_STREAM_FAILURES + 50));
+    }
+
+    /// Giving up must happen in a bounded, short time.
+    #[test]
+    fn giving_up_is_bounded_in_wall_clock_time() {
+        let worst = STREAM_FAILURE_BACKOFF * MAX_CONSECUTIVE_STREAM_FAILURES;
+        assert!(
+            worst <= Duration::from_secs(2),
+            "should abandon a dead device in seconds, not {worst:?}"
+        );
     }
 }
